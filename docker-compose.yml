@@ -1,0 +1,36 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - BACKEND_URL=http://backend:80
+      - LOG_LEVEL=info
+    depends_on:
+      - backend
+      - redis
+    restart: unless-stopped
+
+  backend:
+    image: nginxdemos/hello:plain-text
+    container_name: dummy-backend
+    ports:
+      - "8081:80"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-cache
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:
