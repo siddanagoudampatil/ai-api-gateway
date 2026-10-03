@@ -1,10 +1,17 @@
-# ai-api-gateway
+# 🚀 AI-Assisted API Gateway (`ai-api-gateway`)
 
-A high-performance API Gateway and Anomaly Detector in Go, designed for high-concurrency microservices and real-time AI/LLM token streaming workloads.
+An intelligent, highly concurrent API Gateway and Reverse Proxy built to route incoming traffic, protect backend microservices from resource exhaustion, and automatically mitigate abuse. 
+
+Designed with a focus on **distributed systems architecture** and **operational excellence**, this project splits the critical path (routing) from asynchronous heavy lifting (AI telemetry analysis). The gateway is written in **Go** for blazing-fast concurrent networking, while a decoupled **Python** worker analyzes traffic streams in real-time to detect anomalies.
 
 ---
 
-## Architecture Overview
+## ✨ Key Features & Architecture
+
+* **High-Throughput Routing (Go):** Utilizes lightweight Go goroutines and `httputil.ReverseProxy` to efficiently multiplex incoming HTTP traffic to downstream backend services with minimal latency overhead.
+* **Distributed Rate Limiting (Redis + Lua):** Implements the **Token Bucket algorithm** via Redis. Uses atomic Lua scripts to prevent race conditions across concurrent requests, ensuring strict, distributed rate-limiting across multiple gateway instances.
+* **AI Anomaly Detection (Python):** The Go gateway streams asynchronous request metadata to Redis. A decoupled Python ML worker consumes this stream, calculating rolling averages and standard deviations to detect layer 7 DDoS patterns and automatically ban malicious IPs in real-time.
+* **Operational Observability (Prometheus & Grafana):** Fully instrumented with Prometheus metrics. Includes a provisioned Grafana dashboard to track P99 API latency, total request throughput, and real-time rejection rates (`HTTP 429` and `HTTP 403`).
 
 ```
                       ┌──────────────────────────────────────────┐
@@ -13,7 +20,7 @@ A high-performance API Gateway and Anomaly Detector in Go, designed for high-con
                                            │ :8080
                                            ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│ ai-api-gateway                                                                  │
+│ ai-api-gateway (Go Core)                                                        │
 │                                                                                 │
 │  ├── GET /healthz ───────────► Instant Orchestrator Liveness (bypasses upstream)│
 │  └── /* (Reverse Proxy Engine)                                                  │
@@ -24,126 +31,82 @@ A high-performance API Gateway and Anomaly Detector in Go, designed for high-con
 │        └── Structured Observability (log/slog JSON logging)                     │
 └───────────────────────┬─────────────────────────────────┬───────────────────────┘
                         │                                 │
-                        │ :80                             │ :6379 (Phase 2+)
+                        │ :80                             │ :6379 (Redis Streams)
                         ▼                                 ▼
              ┌─────────────────────┐           ┌────────────────────┐
-             │ Upstream AI Backend │           │    Redis Cache     │
-             │   (Mock Service)    │           │ (Distributed State)│
-             └─────────────────────┘           └────────────────────┘
+             │ Upstream AI Backend │           │    Redis State     │
+             │   (Mock Service)    │           │ (Tokens & Streams) │
+             └─────────────────────┘           └─────────┬──────────┘
+                                                         │
+                                                         ▼
+                                               ┌────────────────────┐
+                                               │ Python ML Worker   │
+                                               │ (Anomaly Detector) │
+                                               └────────────────────┘
 ```
 
-### Key Engineering Decisions
-
-- **Modern Rewrite Hook (`httputil.ProxyRequest`):** Uses Go 1.20+ `Rewrite` semantics instead of legacy `Director`. Sanitizes hop-by-hop headers, standardizes `X-Forwarded-*` forwarding without internal network disclosure, and generates `X-Request-ID` correlation identifiers.
-- **Connection Pool Tuning:** Standard Go `http.DefaultTransport` limits `MaxIdleConnsPerHost` to `2`. Under high-concurrency gateway workloads targeting concentrated backends, this triggers TCP connection thrashing and ephemeral port exhaustion. Default connection pooling is configured with `MaxIdleConns: 1000` and `MaxIdleConnsPerHost: 100`.
-- **Low-Latency Streaming:** Setting `FlushInterval: -1ms` forces immediate flush on received chunks. This minimizes Time-To-First-Token (TTFT) for Server-Sent Events (SSE) and streamed LLM responses.
-- **Orchestrator Health Isolation:** The `/healthz` probe terminates directly at the gateway multiplexer without touching upstream backends, preventing cascading health check failures if downstreams experience transient degradation.
-- **Graceful Shutdown:** Intercepts `SIGINT` and `SIGTERM` with a 15-second draining window to let in-flight upstream transactions complete cleanly before listener teardown.
+## 🛠️ Tech Stack
+* **Core Gateway:** Go (Golang 1.22+)
+* **AI / Worker:** Python
+* **State & Caching:** Redis 7 (Streams, Sets, Lua Scripting)
+* **Observability:** Prometheus, Grafana
+* **Infrastructure:** Docker & Docker Compose
 
 ---
 
-## Directory Structure
+## ⚙️ Configuration
 
-```
-ai-api-gateway/
-├── cmd/
-│   └── gateway/
-│       └── main.go           # Application entrypoint, config loading, and HTTP lifecycle
-├── internal/
-│   └── proxy/
-│       ├── handler.go        # Reverse proxy implementation and connection pool setup
-│       └── handler_test.go   # Integration unit tests (timeout, failure, and proxy assertions)
-├── Dockerfile                # Multi-stage static build using alpine runtime and non-root user
-├── docker-compose.yml        # Orchestration for gateway, mock backend, and Redis
-├── go.mod                    # Go 1.22+ module definition
-└── go.sum                    # Dependency checksums
-```
-
----
-
-## Configuration
-
-All configuration parameters are driven through environment variables:
+Environment variables drive runtime configuration:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `PORT` / `GATEWAY_PORT` | `8080` | Port on which the gateway listens. |
 | `BACKEND_URL` / `TARGET_URL` | `http://localhost:8081` | Upstream target service URL (`http://backend:80` in Compose). |
 | `LOG_LEVEL` | `info` | Logging verbosity (`debug`, `info`, `warn`, `error`). |
-| `READ_TIMEOUT` | `15s` | Maximum duration for reading the entire incoming request. |
-| `WRITE_TIMEOUT` | `60s` | Maximum duration before timing out writes of the response. |
-| `IDLE_TIMEOUT` | `120s` | Maximum amount of time to keep an idle keep-alive connection open. |
+| `READ_TIMEOUT` | `15s` | Maximum duration for reading incoming requests. |
+| `WRITE_TIMEOUT` | `60s` | Maximum duration before timing out response writes. |
+| `IDLE_TIMEOUT` | `120s` | Maximum duration to keep idle keep-alive connections alive. |
 
 ---
 
-## Getting Started
+## 🚦 Getting Started
 
-### Prerequisites
+### Local Multi-Container Environment
 
-- Go 1.22+
-- Docker & Docker Compose
-
-### Running with Docker Compose
-
-Spin up the gateway, mock upstream backend, and Redis instance:
+Spin up the entire stack using Docker Compose:
 
 ```bash
 docker compose up -d --build
 ```
 
 Verify service status:
-
 ```bash
 docker compose ps
 ```
 
-### Running Bare-Metal Locally
+### Verification
 
-1. Start upstream dependencies:
+1. **Test Proxy Routing:**
    ```bash
-   docker compose up -d backend redis
+   curl -i http://localhost:8080
+   ```
+   *Expected response includes `Via: 1.1 ai-api-gateway` and upstream metadata.*
+
+2. **Liveness Probe:**
+   ```bash
+   curl -i http://localhost:8080/healthz
    ```
 
-2. Run the gateway:
+3. **Run Unit Tests:**
    ```bash
-   BACKEND_URL=http://localhost:8081 PORT=8080 go run ./cmd/gateway
+   go test -v ./...
    ```
 
 ---
 
-## Verification & Testing
+## 🗺️ Project Roadmap
 
-### 1. Verify Proxy Forwarding
-Send a request to the gateway to confirm traffic routing to upstream:
-```bash
-curl -i http://localhost:8080
-```
-Expected output contains the upstream response and the gateway verification header:
-```http
-HTTP/1.1 200 OK
-Via: 1.1 ai-api-gateway
-...
-```
-
-### 2. Verify Gateway Health Probe
-```bash
-curl -i http://localhost:8080/healthz
-```
-Response:
-```json
-{"status":"healthy","time":"2026-10-03T04:40:51Z"}
-```
-
-### 3. Run Unit Tests
-```bash
-go test -v ./...
-```
-
----
-
-## Roadmap
-
-- [x] **Phase 1:** Core High-Throughput Reverse Proxy & Container Infrastructure
-- [ ] **Phase 2:** Distributed Token Bucket Rate Limiting (Redis-backed)
-- [ ] **Phase 3:** Streaming Anomaly Detection Engine (Inference latency & payload pattern analysis)
-- [ ] **Phase 4:** OpenTelemetry Tracing & Prometheus Metric Exporting
+- [x] **Phase 1: Core Routing Infrastructure** (Go Reverse Proxy, Docker Compose, Redis setup)
+- [ ] **Phase 2: Distributed Rate Limiting** (Redis + Lua Token Bucket middleware)
+- [ ] **Phase 3: Python ML Anomaly Detection** (Async Redis stream consumer, dynamic IP blacklisting)
+- [ ] **Phase 4: Full Observability Suite** (Prometheus metric exporter & Grafana dashboard)
