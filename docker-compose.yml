@@ -10,6 +10,9 @@ services:
       - PORT=8080
       - BACKEND_URL=http://backend:80
       - LOG_LEVEL=info
+      - REDIS_ADDR=redis:6379
+      - RATE_LIMIT_RPS=5
+      - RATE_LIMIT_BURST=10
     depends_on:
       - backend
       - redis

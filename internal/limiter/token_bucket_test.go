@@ -77,6 +77,200 @@ func TestTokenBucketLimiter_FailOpenOnRedisFailure(t *testing.T) {
 	}
 }
 
+func setupTestRedis(t *testing.T) *redis.Client {
+	t.Helper()
+	rdb := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		rdb.Close()
+		t.Skipf("skipping redis test; redis not reachable on localhost:6379: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = rdb.Close()
+	})
+
+	return rdb
+}
+
+func TestTokenBucketLimiter_BurstAllowance(t *testing.T) {
+	rdb := setupTestRedis(t)
+
+	limiter, err := NewTokenBucketLimiter(Config{
+		Client: rdb,
+		Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("failed to create limiter: %v", err)
+	}
+
+	testKey := "ratelimit:test:burst:" + time.Now().Format("20060102150405.000000000")
+	defer rdb.Del(context.Background(), testKey)
+
+	ctx := context.Background()
+	burst := int64(5)
+	rate := 1.0 // 1 token per second
+
+	// Exhaust exactly the burst allowance
+	for i := int64(0); i < burst; i++ {
+		res, err := limiter.Allow(ctx, testKey, burst, rate)
+		if err != nil {
+			t.Fatalf("call %d returned unexpected error: %v", i+1, err)
+		}
+		if !res.Allowed {
+			t.Fatalf("call %d: expected Allowed=true within burst, got false", i+1)
+		}
+		expectedRemaining := burst - 1 - i
+		if res.Remaining != expectedRemaining {
+			t.Errorf("call %d: expected Remaining=%d, got %d", i+1, expectedRemaining, res.Remaining)
+		}
+		if res.RetryAfter != 0 {
+			t.Errorf("call %d: expected RetryAfter=0 for allowed request, got %v", i+1, res.RetryAfter)
+		}
+	}
+}
+
+func TestTokenBucketLimiter_SubsequentRejection(t *testing.T) {
+	rdb := setupTestRedis(t)
+
+	limiter, err := NewTokenBucketLimiter(Config{
+		Client: rdb,
+		Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("failed to create limiter: %v", err)
+	}
+
+	testKey := "ratelimit:test:rejection:" + time.Now().Format("20060102150405.000000000")
+	defer rdb.Del(context.Background(), testKey)
+
+	ctx := context.Background()
+	burst := int64(2)
+	rate := 1.0
+
+	// Consume entire burst capacity
+	for i := 0; i < int(burst); i++ {
+		res, err := limiter.Allow(ctx, testKey, burst, rate)
+		if err != nil || !res.Allowed {
+			t.Fatalf("preconditioning call %d failed: res=%+v, err=%v", i+1, res, err)
+		}
+	}
+
+	// Subsequent request must be rejected
+	rejectedRes, err := limiter.Allow(ctx, testKey, burst, rate)
+	if err != nil {
+		t.Fatalf("unexpected error on rejected call: %v", err)
+	}
+	if rejectedRes.Allowed {
+		t.Fatalf("expected Allowed=false after burst exhaustion, got true")
+	}
+	if rejectedRes.Remaining != 0 {
+		t.Errorf("expected Remaining=0 on rejection, got %d", rejectedRes.Remaining)
+	}
+	if rejectedRes.RetryAfter <= 0 {
+		t.Errorf("expected positive RetryAfter duration on rejection, got %v", rejectedRes.RetryAfter)
+	}
+
+	// Immediate next request must also be rejected
+	immediateRes, err := limiter.Allow(ctx, testKey, burst, rate)
+	if err != nil {
+		t.Fatalf("unexpected error on repeated rejected call: %v", err)
+	}
+	if immediateRes.Allowed {
+		t.Fatalf("expected Allowed=false on repeated request, got true")
+	}
+}
+
+func TestTokenBucketLimiter_TokenReplenishment(t *testing.T) {
+	rdb := setupTestRedis(t)
+
+	limiter, err := NewTokenBucketLimiter(Config{
+		Client: rdb,
+		Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("failed to create limiter: %v", err)
+	}
+
+	testKey := "ratelimit:test:replenish:" + time.Now().Format("20060102150405.000000000")
+	defer rdb.Del(context.Background(), testKey)
+
+	ctx := context.Background()
+	burst := int64(2)
+	rate := 5.0 // 5 tokens per second = 1 token per 200ms
+
+	// Drain bucket
+	for i := 0; i < int(burst); i++ {
+		res, err := limiter.Allow(ctx, testKey, burst, rate)
+		if err != nil || !res.Allowed {
+			t.Fatalf("pre-drain call %d failed: res=%+v, err=%v", i+1, res, err)
+		}
+	}
+
+	// Verify drained
+	exhaustedRes, err := limiter.Allow(ctx, testKey, burst, rate)
+	if err != nil || exhaustedRes.Allowed {
+		t.Fatalf("expected bucket to be exhausted, got res=%+v, err=%v", exhaustedRes, err)
+	}
+
+	// Wait 250ms for replenishment (>= 1.25 tokens at 5 tokens/sec)
+	time.Sleep(250 * time.Millisecond)
+
+	// Post-replenishment call must succeed
+	replenishedRes, err := limiter.Allow(ctx, testKey, burst, rate)
+	if err != nil {
+		t.Fatalf("unexpected error after replenishment window: %v", err)
+	}
+	if !replenishedRes.Allowed {
+		t.Fatalf("expected Allowed=true after token replenishment, got false (RetryAfter=%v)", replenishedRes.RetryAfter)
+	}
+}
+
+func TestTokenBucketLimiter_AllowN(t *testing.T) {
+	rdb := setupTestRedis(t)
+
+	limiter, err := NewTokenBucketLimiter(Config{
+		Client: rdb,
+		Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("failed to create limiter: %v", err)
+	}
+
+	testKey := "ratelimit:test:allown:" + time.Now().Format("20060102150405.000000000")
+	defer rdb.Del(context.Background(), testKey)
+
+	ctx := context.Background()
+	burst := int64(10)
+	rate := 5.0
+
+	// Consume 6 tokens at once: Allowed (10 -> 4)
+	res1, err := limiter.AllowN(ctx, testKey, burst, rate, 6)
+	if err != nil || !res1.Allowed || res1.Remaining != 4 {
+		t.Fatalf("AllowN(6): expected Allowed=true, Remaining=4, got res=%+v, err=%v", res1, err)
+	}
+
+	// Request 5 tokens: Rejected (only 4 tokens remaining)
+	res2, err := limiter.AllowN(ctx, testKey, burst, rate, 5)
+	if err != nil || res2.Allowed {
+		t.Fatalf("AllowN(5): expected Allowed=false, got res=%+v, err=%v", res2, err)
+	}
+	if res2.RetryAfter <= 0 {
+		t.Errorf("AllowN(5): expected positive RetryAfter, got %v", res2.RetryAfter)
+	}
+
+	// Request 4 tokens: Allowed (4 -> 0)
+	res3, err := limiter.AllowN(ctx, testKey, burst, rate, 4)
+	if err != nil || !res3.Allowed || res3.Remaining != 0 {
+		t.Fatalf("AllowN(4): expected Allowed=true, Remaining=0, got res=%+v, err=%v", res3, err)
+	}
+}
+
 func TestTokenBucketLimiter_RedisIntegration(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",

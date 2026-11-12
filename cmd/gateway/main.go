@@ -9,20 +9,27 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+	"github.com/siddanagoudampatil/ai-api-gateway/internal/limiter"
+	"github.com/siddanagoudampatil/ai-api-gateway/internal/middleware"
 	"github.com/siddanagoudampatil/ai-api-gateway/internal/proxy"
 )
 
 type serverConfig struct {
-	port         string
-	backendURL   string
-	logLevel     string
-	readTimeout  time.Duration
-	writeTimeout time.Duration
-	idleTimeout  time.Duration
+	port           string
+	backendURL     string
+	redisAddr      string
+	rateLimitRPS   float64
+	rateLimitBurst int64
+	logLevel       string
+	readTimeout    time.Duration
+	writeTimeout   time.Duration
+	idleTimeout    time.Duration
 }
 
 func loadConfig() serverConfig {
@@ -42,6 +49,14 @@ func loadConfig() serverConfig {
 		backendURL = "http://localhost:8081"
 	}
 
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+
+	rateLimitRPS := parseFloat(os.Getenv("RATE_LIMIT_RPS"), 5.0)
+	rateLimitBurst := parseInt64(os.Getenv("RATE_LIMIT_BURST"), 10)
+
 	readTimeout := parseDuration(os.Getenv("READ_TIMEOUT"), 15*time.Second)
 	writeTimeout := parseDuration(os.Getenv("WRITE_TIMEOUT"), 60*time.Second)
 	idleTimeout := parseDuration(os.Getenv("IDLE_TIMEOUT"), 120*time.Second)
@@ -52,13 +67,38 @@ func loadConfig() serverConfig {
 	}
 
 	return serverConfig{
-		port:         port,
-		backendURL:   backendURL,
-		logLevel:     logLevel,
-		readTimeout:  readTimeout,
-		writeTimeout: writeTimeout,
-		idleTimeout:  idleTimeout,
+		port:           port,
+		backendURL:     backendURL,
+		redisAddr:      redisAddr,
+		rateLimitRPS:   rateLimitRPS,
+		rateLimitBurst: rateLimitBurst,
+		logLevel:       logLevel,
+		readTimeout:    readTimeout,
+		writeTimeout:   writeTimeout,
+		idleTimeout:    idleTimeout,
 	}
+}
+
+func parseFloat(raw string, fallback float64) float64 {
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v <= 0 {
+		return fallback
+	}
+	return v
+}
+
+func parseInt64(raw string, fallback int64) int64 {
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || v <= 0 {
+		return fallback
+	}
+	return v
 }
 
 func parseDuration(raw string, fallback time.Duration) time.Duration {
@@ -93,11 +133,11 @@ func setupLogger(levelStr string) *slog.Logger {
 	return logger
 }
 
-func buildRouter(proxyHandler http.Handler) http.Handler {
+func buildRouter(proxyHandler http.Handler, rateLimiter *limiter.TokenBucketLimiter, rps float64, burst int64, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 
-	// Direct orchestrator liveness checks bypass reverse proxy hops to prevent
-	// cascading liveness probe failures if downstream dependencies degrade.
+	// Direct orchestrator liveness checks bypass reverse proxy hops and rate limiting
+	// to prevent cascading liveness probe failures if downstream dependencies degrade.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -107,7 +147,8 @@ func buildRouter(proxyHandler http.Handler) http.Handler {
 		})
 	})
 
-	mux.Handle("/", proxyHandler)
+	rateLimitedProxy := middleware.RateLimit(rateLimiter, rps, burst, logger)(proxyHandler)
+	mux.Handle("/", rateLimitedProxy)
 	return mux
 }
 
@@ -133,7 +174,34 @@ func main() {
 		os.Exit(1)
 	}
 
-	router := buildRouter(proxyHandler)
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         cfg.redisAddr,
+		PoolSize:     100,
+		MinIdleConns: 10,
+		DialTimeout:  5 * time.Second,
+	})
+
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if err := rdb.Ping(pingCtx).Err(); err != nil {
+		logger.Warn("redis connection check failed at boot; rate limiting will operate in fail-open mode",
+			slog.String("redis_addr", cfg.redisAddr),
+			slog.Any("error", err),
+		)
+	} else {
+		logger.Info("connected to redis", slog.String("redis_addr", cfg.redisAddr))
+	}
+	pingCancel()
+
+	tokenLimiter, err := limiter.NewTokenBucketLimiter(limiter.Config{
+		Client: rdb,
+		Logger: logger,
+	})
+	if err != nil {
+		logger.Error("failed to initialize token bucket limiter", slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	router := buildRouter(proxyHandler, tokenLimiter, cfg.rateLimitRPS, cfg.rateLimitBurst, logger)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.port,
@@ -150,6 +218,9 @@ func main() {
 		logger.Info("starting api gateway",
 			slog.String("addr", srv.Addr),
 			slog.String("target_backend", targetURL.String()),
+			slog.String("redis_addr", cfg.redisAddr),
+			slog.Float64("rate_limit_rps", cfg.rateLimitRPS),
+			slog.Int64("rate_limit_burst", cfg.rateLimitBurst),
 			slog.Duration("read_timeout", cfg.readTimeout),
 			slog.Duration("write_timeout", cfg.writeTimeout),
 		)
@@ -169,7 +240,12 @@ func main() {
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("forced shutdown due to context timeout", slog.Any("error", err))
-		os.Exit(1)
+	}
+
+	if err := rdb.Close(); err != nil {
+		logger.Error("failed to close redis connection pool cleanly", slog.Any("error", err))
+	} else {
+		logger.Info("redis connection pool closed cleanly")
 	}
 
 	logger.Info("api gateway stopped cleanly")
